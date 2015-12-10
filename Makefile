@@ -13,8 +13,8 @@ V__link_V_1 =
 
 CC = gcc -std=c99
 PKGCONFIG = $(shell which pkg-config)
-CFLAGS = $(shell $(PKGCONFIG) --cflags gio-2.0 gtk+-3.0 gstreamer-1.0 epoxy)
-LIBS = $(shell $(PKGCONFIG) --libs gio-2.0 gtk+-3.0 gstreamer-1.0 epoxy) -lm
+CFLAGS = $(shell $(PKGCONFIG) --cflags gio-2.0 gtk+-3.0 gstreamer-1.0 epoxy) -g -O0
+LIBS = -lGL $(shell $(PKGCONFIG) --libs gio-2.0 gtk+-3.0 gstreamer-1.0 gstreamer-video-1.0 gstreamer-plugins-bad-1.0 gstreamer-gl-1.0 epoxy) -lm
 GLIB_COMPILE_RESOURCES = $(shell $(PKGCONFIG) --variable=glib_compile_resources gio-2.0)
 GLIB_COMPILE_SCHEMAS = $(shell $(PKGCONFIG) --variable=glib_compile_schemas gio-2.0)
 

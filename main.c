@@ -1,5 +1,16 @@
 #include <gtk/gtk.h>
-#include <epoxy/gl.h>
+#include <gdk/gdkx.h>
+
+#include <gst/gst.h>
+#include <gst/gl/gl.h>
+
+#include <GL/gl.h>
+#include <GL/glx.h>
+
+#if GST_GL_HAVE_WINDOW_X11 && defined (GDK_WINDOWING_X11)
+#include <X11/Xlib.h>
+#include <gst/gl/x11/gstgldisplay_x11.h>
+#endif
 
 #define GLAREA_ERROR (glarea_error_quark ())
 
@@ -43,26 +54,32 @@ static int const vertex_indice[] = {
 };
 
 static struct {
-  guint vao;
+  GLXContext gl_context;
+  Display *display;
+  GstGLContext *gst_gl_context;
+  GstGLDisplay *gst_gl_display;
+
+  GtkWidget *gl_area;
+  GstVideoFrame *video_frame;
+  guint texture;
+  guint vertex_buffer;
+  guint indice_buffer;
   guint program;
   guint vertex_pos_attrib;
   guint texture_coord_attrib;
+  guint texture_attrib;
 } scene_info;
 
 static void
 init_buffers (guint  vertex_pos_attrib,
               guint  texture_coord_attrib,
-              guint *vao_out)
+              guint *vertex_buffer_out,
+              guint *indice_buffer_out)
 {
-  guint vao, buffer, indice_buffer;
+  guint vertex_buffer, indice_buffer;
 
-  /* we need to create a VAO to store the other buffers */
-  glGenVertexArrays (1, &vao);
-  glBindVertexArray (vao);
-
-  /* this is the VBO that holds the vertex data */
-  glGenBuffers (1, &buffer);
-  glBindBuffer (GL_ARRAY_BUFFER, buffer);
+  glGenBuffers (1, &vertex_buffer);
+  glBindBuffer (GL_ARRAY_BUFFER, vertex_buffer);
   glBufferData (GL_ARRAY_BUFFER, sizeof (vertex_data), vertex_data, GL_STATIC_DRAW);
 
   /* enable and set the position attribute */
@@ -81,15 +98,13 @@ init_buffers (guint  vertex_pos_attrib,
   glBindBuffer (GL_ELEMENT_ARRAY_BUFFER, indice_buffer);
   glBufferData (GL_ELEMENT_ARRAY_BUFFER, sizeof (vertex_indice), vertex_indice, GL_STATIC_DRAW);
 
-  /* reset the state; we will re-enable the VAO when needed */
+  /* reset the state; we will re-enable buffers when needed */
   glBindBuffer (GL_ARRAY_BUFFER, 0);
-  glBindVertexArray (0);
 
-  /* the VBO is referenced by the VAO */
-  glDeleteBuffers (1, &buffer);
-
-  if (vao_out != NULL)
-    *vao_out = vao;
+  if (vertex_buffer_out != NULL)
+    *vertex_buffer_out = vertex_buffer;
+  if (indice_buffer_out != NULL)
+    *indice_buffer_out = indice_buffer;
 }
 
 static guint
@@ -133,11 +148,13 @@ static gboolean
 init_shaders (guint   *program_out,
               guint   *vertex_pos_attrib_out,
               guint   *texture_coord_attrib_out,
+              guint   *texture_attrib_out,
               GError **error)
 {
   guint program = 0;
   guint vertex_pos_attrib = 0;
   guint texture_coord_attrib = 0;
+  guint texture_attrib = 0;
   guint vertex = 0, fragment = 0;
 
   /* load the vertex shader */
@@ -179,6 +196,7 @@ init_shaders (guint   *program_out,
 
   vertex_pos_attrib = glGetUniformLocation (program, "aVertexPosition");
   texture_coord_attrib = glGetAttribLocation (program, "aTextureCoord");
+  texture_attrib = glGetUniformLocation (program, "uSampler");
 
   /* the individual shaders can be detached and destroyed */
   glDetachShader (program, vertex);
@@ -196,6 +214,8 @@ out:
     *vertex_pos_attrib_out = vertex_pos_attrib;
   if (texture_coord_attrib_out != NULL)
     *texture_coord_attrib_out = texture_coord_attrib;
+  if (texture_attrib_out != NULL)
+    *texture_attrib_out = texture_attrib;
 
   return program != 0;
 }
@@ -215,6 +235,7 @@ realize (GtkWidget *widget)
   if (!init_shaders (&scene_info.program,
                      &scene_info.vertex_pos_attrib,
                      &scene_info.texture_coord_attrib,
+                     &scene_info.texture_attrib,
                      &error))
     {
       /* set the GtkGLArea in error state, so we'll see the error message
@@ -226,8 +247,11 @@ realize (GtkWidget *widget)
     }
 
   /* initialize the vertex buffers */
-  init_buffers (scene_info.vertex_pos_attrib,
-                scene_info.texture_coord_attrib, &scene_info.vao);
+  init_buffers (scene_info.vertex_pos_attrib, scene_info.texture_coord_attrib,
+                &scene_info.vertex_buffer, &scene_info.indice_buffer);
+
+  scene_info.gl_context = glXGetCurrentContext();
+  scene_info.display = gdk_x11_display_get_xdisplay (gdk_display_get_default ());
 }
 
 static void
@@ -241,8 +265,10 @@ unrealize (GtkWidget *widget)
     return;
 
   /* destroy all the resources we created */
-  if (scene_info.vao != 0)
-    glDeleteVertexArrays (1, &scene_info.vao);
+  if (scene_info.vertex_buffer != 0)
+    glDeleteBuffers (1, &scene_info.vertex_buffer);
+  if (scene_info.indice_buffer != 0)
+    glDeleteBuffers (1, &scene_info.indice_buffer);
   if (scene_info.program != 0)
     glDeleteProgram (scene_info.program);
 }
@@ -259,26 +285,106 @@ render (GtkGLArea *area, GdkGLContext *context)
   glClearColor (0, 0, 0, 0);
   glClear (GL_COLOR_BUFFER_BIT);
 
-  if (scene_info.program == 0 || scene_info.vao == 0)
+  if (scene_info.program == 0 || scene_info.vertex_buffer == 0)
     return TRUE;
 
   /* load our program */
   glUseProgram (scene_info.program);
 
-  /* use the buffers in the VAO */
-  glBindVertexArray (scene_info.vao);
+  glBindBuffer(GL_ARRAY_BUFFER, scene_info.vertex_buffer);
+  glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, scene_info.indice_buffer);
+
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, scene_info.texture);
+  glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+  glUniform1i (scene_info.texture_attrib, 0);
 
   /* draw the three vertices as a triangle */
   glDrawElements (GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0);
 
   /* we finished using the buffers and program */
-  glBindVertexArray (0);
+  glBindBuffer(GL_ARRAY_BUFFER, 0);
+  glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
   glUseProgram (0);
 
   // we completed our drawing; the draw commands will be
   // flushed at the end of the signal emission chain, and
   // the buffers will be drawn on the window
   return TRUE;
+}
+
+//client draw callback
+static gboolean drawCallback (GstElement *gl_sink, GstGLContext *context, GstSample *sample, gpointer data)
+{
+  GstBuffer *buf = gst_sample_get_buffer (sample);
+  GstCaps *caps = gst_sample_get_caps (sample);
+  GstVideoInfo video_info;
+
+  gst_video_info_from_caps (&video_info, caps);
+
+  if (scene_info.video_frame) {
+    gst_video_frame_unmap (scene_info.video_frame);
+    g_free (scene_info.video_frame);
+  }
+
+  scene_info.video_frame = g_malloc0 (sizeof (GstVideoFrame));
+
+  if (!gst_video_frame_map (scene_info.video_frame, &video_info, buf, (GstMapFlags) (GST_MAP_READ | GST_MAP_GL))) {
+    g_warning ("Failed to map the video buffer");
+    return TRUE;
+  }
+  scene_info.texture = *(guint *) scene_info.video_frame->data[0];
+
+  gtk_widget_queue_draw (scene_info.gl_area);
+  return TRUE;
+}
+
+static gboolean
+ensure_gst_glcontext()
+{
+  scene_info.gst_gl_display = GST_GL_DISPLAY (gst_gl_display_x11_new_with_display (scene_info.display));
+  GstGLPlatform gst_gl_platform = GST_GL_PLATFORM_GLX;
+  GstGLAPI gst_gl_API = GST_GL_API_OPENGL;
+
+  if (!scene_info.gl_context)
+    return FALSE;
+
+  scene_info.gst_gl_context = gst_gl_context_new_wrapped(scene_info.gst_gl_display, (guintptr) scene_info.gl_context, gst_gl_platform, gst_gl_API);
+  return TRUE;
+}
+
+static GstBusSyncReply
+handle_sync_message (GstBus * bus, GstMessage * message, gpointer userData)
+{
+  const gchar* context_type;
+
+  if (GST_MESSAGE_TYPE (message) != GST_MESSAGE_NEED_CONTEXT)
+    return GST_BUS_DROP;
+
+  gst_message_parse_context_type(message, &context_type);
+
+  if (!ensure_gst_glcontext())
+    return GST_BUS_DROP;
+
+  if (!g_strcmp0(context_type, GST_GL_DISPLAY_CONTEXT_TYPE)) {
+    GstContext* display_context = gst_context_new(GST_GL_DISPLAY_CONTEXT_TYPE, TRUE);
+    gst_context_set_gl_display(display_context, scene_info.gst_gl_display);
+    gst_element_set_context(GST_ELEMENT(message->src), display_context);
+    return GST_BUS_DROP;
+  }
+
+  if (!g_strcmp0(context_type, "gst.gl.app_context")) {
+      GstContext* app_context = gst_context_new("gst.gl.app_context", TRUE);
+      GstStructure* structure = gst_context_writable_structure(app_context);
+      gst_structure_set(structure, "context", GST_GL_TYPE_CONTEXT, scene_info.gst_gl_context, NULL);
+      gst_element_set_context(GST_ELEMENT(message->src), app_context);
+  }
+
+  return GST_BUS_DROP;
 }
 
 static void
@@ -288,6 +394,10 @@ activate (GtkApplication *app,
   GtkWidget *window;
   GtkWidget *gl_area;
   GtkWidget *button_box;
+  GstElement *pipeline, *videosrc, *glimagesink;
+  GstStateChangeReturn ret;
+  GstCaps *caps;
+  GstBus *bus;
 
   window = gtk_application_window_new (app);
   gtk_window_set_title (GTK_WINDOW (window), "Window");
@@ -298,8 +408,45 @@ activate (GtkApplication *app,
   g_signal_connect (gl_area, "realize", G_CALLBACK (realize), NULL);
   g_signal_connect (gl_area, "unrealize", G_CALLBACK (unrealize), NULL);
   gtk_container_add (GTK_CONTAINER (window), gl_area);
+  scene_info.gl_area = gl_area;
 
   gtk_widget_show_all (window);
+
+  scene_info.video_frame = NULL;
+  /* create elements */
+  pipeline = gst_pipeline_new ("pipeline");
+  videosrc = gst_element_factory_make ("videotestsrc", "videotestsrc");
+  glimagesink = gst_element_factory_make ("glimagesink", "glimagesink");
+
+  caps = gst_caps_new_simple("video/x-raw",
+                             "width", G_TYPE_INT, 640,
+                             "height", G_TYPE_INT, 480,
+                             "framerate", GST_TYPE_FRACTION, 25, 1,
+                             "format", G_TYPE_STRING, "RGBA",
+                             NULL) ;
+
+  g_signal_connect_swapped(G_OBJECT(glimagesink), "client-draw", G_CALLBACK (drawCallback), NULL);
+
+  gst_bin_add_many (GST_BIN (pipeline), videosrc, glimagesink, NULL);
+
+  gboolean link_ok = gst_element_link_filtered(videosrc, glimagesink, caps) ;
+  gst_caps_unref(caps) ;
+  if(!link_ok)
+  {
+      g_warning("Failed to link videosrc to glimagesink!\n") ;
+      return;
+  }
+
+  bus = gst_pipeline_get_bus (GST_PIPELINE (pipeline));
+  gst_bus_set_sync_handler(bus, (GstBusSyncHandler) (handle_sync_message), NULL, NULL);
+  gst_object_unref (bus);
+
+  //start
+  ret = gst_element_set_state (pipeline, GST_STATE_PLAYING);
+  if (ret == GST_STATE_CHANGE_FAILURE) {
+    g_print ("Failed to start up pipeline!\n");
+    return;
+  }
 }
 
 int
@@ -308,6 +455,10 @@ main (int    argc,
 {
   GtkApplication *app;
   int status;
+
+  XInitThreads();
+  gtk_init (&argc, &argv);
+  gst_init (&argc, &argv);
 
   app = gtk_application_new ("org.gtk.example.glarea", G_APPLICATION_FLAGS_NONE);
   g_signal_connect (app, "activate", G_CALLBACK (activate), NULL);
