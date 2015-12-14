@@ -14,6 +14,25 @@
 
 #define GLAREA_ERROR (glarea_error_quark ())
 
+#define GLCOMMAND(command) command; _print_OpenGL_error(__FILE__, __LINE__)
+
+#define print_OpenGL_Error() _print_OpenGL_error(__FILE__, __LINE__)
+
+static int _print_OpenGL_error(char *file, int line)
+{
+  GLenum glErr;
+  int    retCode = 0;
+
+  glErr = glGetError();
+  if (glErr != GL_NO_ERROR)
+  {
+    printf("glError in file %s @ line %d: %d\n",
+	     file, line, glErr);
+    retCode = 1;
+  }
+  return retCode;
+}
+
 typedef enum {
   GLAREA_ERROR_SHADER_COMPILATION,
   GLAREA_ERROR_SHADER_LINK
@@ -22,20 +41,25 @@ typedef enum {
 G_DEFINE_QUARK (glarea-error, glarea_error)
 
 static char const *vertex_shader_str =
-"attribute vec3 aVertexPosition;\n"
-"attribute vec2 aTextureCoord;\n"
-"varying vec2 vTextureCoord;\n"
-"void main(void) {\n"
-"  gl_Position = vec4(aVertexPosition, 1.0);\n"
-"  vTextureCoord = aTextureCoord;\n"
-"}\n";
+      "attribute vec3 aVertexPosition;   \n"
+      "attribute vec2 aTextureCoord;   \n"
+      "varying vec2 vTexureCoord;     \n"
+      "void main()                  \n"
+      "{                            \n"
+      "   gl_Position = vec4(aVertexPosition, 1.0); \n"
+      "   vTexureCoord = aTextureCoord;  \n"
+      "}                            \n";
 
 static char const *fragment_shader_str =
-"varying vec2 vTextureCoord;\n"
-"uniform sampler2D uSampler;\n"
-"void main(void) {\n"
-"  gl_FragColor = texture2D(uSampler, vec2(vTextureCoord.s, vTextureCoord.t));\n"
-"}\n";
+      "#ifdef GL_ES                                        \n"
+      "precision mediump float;                            \n"
+      "#endif                                              \n"
+      "varying vec2 vTexureCoord;                            \n"
+      "uniform sampler2D tex;                              \n"
+      "void main()                                         \n"
+      "{                                                   \n"
+      "  gl_FragColor = texture2D( tex, vTexureCoord );      \n"
+      "}                                                   \n";
 
 struct vertex_info {
   float position[3];
@@ -43,26 +67,34 @@ struct vertex_info {
 };
 
 static const struct vertex_info vertex_data[] = {
-  { { -1.0f, -1.0f,  1.0f }, { 0.0f, 0.0f } },
-  { {  1.0f, -1.0f,  1.0f }, { 1.0f, 0.0f } },
-  { {  1.0f,  1.0f,  1.0f }, { 1.0f, 1.0f } },
-  { { -1.0f,  1.0f,  1.0f }, { 0.0f, 1.0f } },
+  { { -1.0f,  1.0f,  0.0f }, { 0.0f, 0.0f } },
+  { { -1.0f, -1.0f,  0.0f }, { 0.0f, 1.0f } },
+  { {  1.0f, -1.0f,  0.0f }, { 1.0f, 1.0f } },
+  { {  1.0f,  1.0f,  0.0f }, { 1.0f, 0.0f } },
 };
 
-static int const vertex_indice[] = {
+static GLushort const vertex_indice[] = {
  0, 1, 2, 0, 2, 3,
 };
 
+typedef struct {
+  GstVideoFrame video_frame;
+  guint texture;
+  GstGLWindow* gst_window;
+} TextureBuffer;
+
 static struct {
+  GMutex draw_mutex;
+  TextureBuffer* current_buffer;
+  TextureBuffer* pending_buffer;
+
   GLXContext gl_context;
   Display *display;
   GstGLContext *gst_gl_context;
   GstGLDisplay *gst_gl_display;
 
   GtkWidget *gl_area;
-  GstVideoFrame *video_frame;
-  guint texture;
-  guint vertex_buffer;
+  guint vao;
   guint indice_buffer;
   guint program;
   guint vertex_pos_attrib;
@@ -73,36 +105,39 @@ static struct {
 static void
 init_buffers (guint  vertex_pos_attrib,
               guint  texture_coord_attrib,
-              guint *vertex_buffer_out,
-              guint *indice_buffer_out)
+              guint *indice_buffer_out,
+              guint *vao_out)
 {
-  guint vertex_buffer, indice_buffer;
+  guint vao, vertex_buffer, indice_buffer;
 
-  glGenBuffers (1, &vertex_buffer);
-  glBindBuffer (GL_ARRAY_BUFFER, vertex_buffer);
-  glBufferData (GL_ARRAY_BUFFER, sizeof (vertex_data), vertex_data, GL_STATIC_DRAW);
+  GLCOMMAND(glGenVertexArrays (1, &vao));
+  GLCOMMAND(glBindVertexArray (vao));
+
+  GLCOMMAND(glGenBuffers (1, &vertex_buffer));
+  GLCOMMAND(glBindBuffer (GL_ARRAY_BUFFER, vertex_buffer));
+  GLCOMMAND(glBufferData (GL_ARRAY_BUFFER, sizeof (vertex_data), vertex_data, GL_STATIC_DRAW));
 
   /* enable and set the position attribute */
-  glEnableVertexAttribArray (vertex_pos_attrib);
-  glVertexAttribPointer (vertex_pos_attrib, 4, GL_FLOAT, GL_FALSE,
-                         sizeof (struct vertex_info),
-                         (GLvoid *) (G_STRUCT_OFFSET (struct vertex_info, position)));
+  GLCOMMAND(glEnableVertexAttribArray (vertex_pos_attrib));
+  GLCOMMAND(glVertexAttribPointer (vertex_pos_attrib, 3, GL_FLOAT, GL_FALSE, sizeof (struct vertex_info), (GLvoid *) (G_STRUCT_OFFSET (struct vertex_info, position))));
 
   /* enable and set the color attribute */
-  glEnableVertexAttribArray (texture_coord_attrib);
-  glVertexAttribPointer (texture_coord_attrib, 4, GL_FLOAT, GL_FALSE,
-                         sizeof (struct vertex_info),
-                         (GLvoid *) (G_STRUCT_OFFSET (struct vertex_info, texture_coord)));
+  GLCOMMAND(glEnableVertexAttribArray (texture_coord_attrib));
+  GLCOMMAND(glVertexAttribPointer (texture_coord_attrib, 2, GL_FLOAT, GL_FALSE, sizeof (struct vertex_info), (GLvoid *) (G_STRUCT_OFFSET (struct vertex_info, texture_coord))));
 
-  glGenBuffers (1, &indice_buffer);
-  glBindBuffer (GL_ELEMENT_ARRAY_BUFFER, indice_buffer);
-  glBufferData (GL_ELEMENT_ARRAY_BUFFER, sizeof (vertex_indice), vertex_indice, GL_STATIC_DRAW);
+  GLCOMMAND(glGenBuffers (1, &indice_buffer));
+  GLCOMMAND(glBindBuffer (GL_ELEMENT_ARRAY_BUFFER, indice_buffer));
+  GLCOMMAND(glBufferData (GL_ELEMENT_ARRAY_BUFFER, sizeof (vertex_indice), vertex_indice, GL_STATIC_DRAW));
 
   /* reset the state; we will re-enable buffers when needed */
-  glBindBuffer (GL_ARRAY_BUFFER, 0);
+  GLCOMMAND(glBindBuffer (GL_ARRAY_BUFFER, 0));
+  GLCOMMAND(glBindVertexArray (0));
 
-  if (vertex_buffer_out != NULL)
-    *vertex_buffer_out = vertex_buffer;
+  GLCOMMAND(glDeleteBuffers (1, &vertex_buffer));
+  GLCOMMAND(glBindBuffer (GL_ELEMENT_ARRAY_BUFFER, 0));
+
+  if (vao_out != NULL)
+    *vao_out = vao;
   if (indice_buffer_out != NULL)
     *indice_buffer_out = indice_buffer;
 }
@@ -114,8 +149,8 @@ create_shader (int          shader_type,
                guint       *shader_out)
 {
   guint shader = glCreateShader (shader_type);
-  glShaderSource (shader, 1, &source, NULL);
-  glCompileShader (shader);
+  GLCOMMAND(glShaderSource (shader, 1, &source, NULL));
+  GLCOMMAND(glCompileShader (shader));
 
   int status;
   glGetShaderiv (shader, GL_COMPILE_STATUS, &status);
@@ -169,12 +204,12 @@ init_shaders (guint   *program_out,
 
   /* link the vertex and fragment shaders together */
   program = glCreateProgram ();
-  glAttachShader (program, vertex);
-  glAttachShader (program, fragment);
-  glLinkProgram (program);
+  GLCOMMAND(glAttachShader (program, vertex));
+  GLCOMMAND(glAttachShader (program, fragment));
+  GLCOMMAND(glLinkProgram (program));
 
   int status = 0;
-  glGetProgramiv (program, GL_LINK_STATUS, &status);
+  GLCOMMAND(glGetProgramiv (program, GL_LINK_STATUS, &status));
   if (status == GL_FALSE)
     {
       int log_len = 0;
@@ -194,13 +229,13 @@ init_shaders (guint   *program_out,
       goto out;
     }
 
-  vertex_pos_attrib = glGetUniformLocation (program, "aVertexPosition");
+  vertex_pos_attrib = glGetAttribLocation (program, "aVertexPosition");
   texture_coord_attrib = glGetAttribLocation (program, "aTextureCoord");
-  texture_attrib = glGetUniformLocation (program, "uSampler");
+  texture_attrib = glGetUniformLocation (program, "tex");
 
   /* the individual shaders can be detached and destroyed */
-  glDetachShader (program, vertex);
-  glDetachShader (program, fragment);
+  GLCOMMAND(glDetachShader (program, vertex));
+  GLCOMMAND(glDetachShader (program, fragment));
 
 out:
   if (vertex != 0)
@@ -248,7 +283,9 @@ realize (GtkWidget *widget)
 
   /* initialize the vertex buffers */
   init_buffers (scene_info.vertex_pos_attrib, scene_info.texture_coord_attrib,
-                &scene_info.vertex_buffer, &scene_info.indice_buffer);
+                &scene_info.indice_buffer, &scene_info.vao);
+
+  g_autoptr(GMutexLocker) locker = g_mutex_locker_new (&scene_info.draw_mutex);
 
   scene_info.gl_context = glXGetCurrentContext();
   scene_info.display = gdk_x11_display_get_xdisplay (gdk_display_get_default ());
@@ -265,51 +302,74 @@ unrealize (GtkWidget *widget)
     return;
 
   /* destroy all the resources we created */
-  if (scene_info.vertex_buffer != 0)
-    glDeleteBuffers (1, &scene_info.vertex_buffer);
+  if (scene_info.vao != 0)
+    glDeleteBuffers (1, &scene_info.vao);
   if (scene_info.indice_buffer != 0)
     glDeleteBuffers (1, &scene_info.indice_buffer);
   if (scene_info.program != 0)
     glDeleteProgram (scene_info.program);
 }
 
+static void
+unmap_texture_buffer_callback(TextureBuffer* buffer)
+{
+  gst_video_frame_unmap(&buffer->video_frame);
+}
+
+static void
+free_texture_buffer_callback(TextureBuffer* buffer)
+{
+  g_free (buffer);
+}
+
 static gboolean
 render (GtkGLArea *area, GdkGLContext *context)
 {
+  TextureBuffer *prev_buffer = NULL;
+  {
+    g_autoptr(GMutexLocker) locker = g_mutex_locker_new (&scene_info.draw_mutex);
+    if (!scene_info.pending_buffer && !scene_info.current_buffer)
+      return TRUE;
+
+    if (scene_info.pending_buffer) {
+      prev_buffer = scene_info.current_buffer;
+      scene_info.current_buffer = scene_info.pending_buffer;
+      scene_info.pending_buffer = NULL;
+    }
+  }
+
+  if (prev_buffer)
+    gst_gl_window_send_message_async(prev_buffer->gst_window, (GstGLWindowCB)unmap_texture_buffer_callback, prev_buffer, (GDestroyNotify)free_texture_buffer_callback);
+
   // inside this function it's safe to use GL; the given
   // #GdkGLContext has been made current to the drawable
   // surface used by the #GtkGLArea and the viewport has
   // already been set to be the size of the allocation
 
   // we can start by clearing the buffer
-  glClearColor (0, 0, 0, 0);
-  glClear (GL_COLOR_BUFFER_BIT);
+  GLCOMMAND(glClearColor (0, 0, 0, 0));
+  GLCOMMAND(glClear (GL_COLOR_BUFFER_BIT));
 
-  if (scene_info.program == 0 || scene_info.vertex_buffer == 0)
+  if (scene_info.program == 0 || scene_info.vao == 0)
     return TRUE;
 
   /* load our program */
-  glUseProgram (scene_info.program);
+  GLCOMMAND(glUseProgram (scene_info.program));
 
-  glBindBuffer(GL_ARRAY_BUFFER, scene_info.vertex_buffer);
-  glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, scene_info.indice_buffer);
+  GLCOMMAND(glBindVertexArray (scene_info.vao));
+  GLCOMMAND(glBindBuffer (GL_ELEMENT_ARRAY_BUFFER, scene_info.indice_buffer));
 
-  glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, scene_info.texture);
-  glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-  glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-  glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-  glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-  glUniform1i (scene_info.texture_attrib, 0);
+  GLCOMMAND(glActiveTexture(GL_TEXTURE0));
+  GLCOMMAND(glBindTexture(GL_TEXTURE_2D, scene_info.current_buffer->texture));
+  GLCOMMAND(glUniform1i (scene_info.texture_attrib, 0));
 
   /* draw the three vertices as a triangle */
-  glDrawElements (GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0);
+  GLCOMMAND(glDrawElements (GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, 0));
 
   /* we finished using the buffers and program */
-  glBindBuffer(GL_ARRAY_BUFFER, 0);
-  glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-  glUseProgram (0);
+  GLCOMMAND(glBindVertexArray (0));
+  GLCOMMAND(glBindBuffer (GL_ELEMENT_ARRAY_BUFFER, 0));
+  GLCOMMAND(glUseProgram (0));
 
   // we completed our drawing; the draw commands will be
   // flushed at the end of the signal emission chain, and
@@ -326,18 +386,22 @@ static gboolean drawCallback (GstElement *gl_sink, GstGLContext *context, GstSam
 
   gst_video_info_from_caps (&video_info, caps);
 
-  if (scene_info.video_frame) {
-    gst_video_frame_unmap (scene_info.video_frame);
-    g_free (scene_info.video_frame);
+  if (scene_info.pending_buffer) {
+    gst_gl_window_send_message_async(scene_info.pending_buffer->gst_window,
+                                     (GstGLWindowCB)unmap_texture_buffer_callback,
+                                     scene_info.pending_buffer,
+                                     (GDestroyNotify)free_texture_buffer_callback);
   }
 
-  scene_info.video_frame = g_malloc0 (sizeof (GstVideoFrame));
+  scene_info.pending_buffer = g_malloc0 (sizeof (TextureBuffer));
+  TextureBuffer *buffer = scene_info.pending_buffer;
+  buffer->gst_window = gst_gl_context_get_window(context);
 
-  if (!gst_video_frame_map (scene_info.video_frame, &video_info, buf, (GstMapFlags) (GST_MAP_READ | GST_MAP_GL))) {
+  if (!gst_video_frame_map (&buffer->video_frame, &video_info, buf, (GstMapFlags) (GST_MAP_READ | GST_MAP_GL))) {
     g_warning ("Failed to map the video buffer");
     return TRUE;
   }
-  scene_info.texture = *(guint *) scene_info.video_frame->data[0];
+  buffer->texture = *(guint *) buffer->video_frame.data[0];
 
   gtk_widget_queue_draw (scene_info.gl_area);
   return TRUE;
@@ -346,6 +410,11 @@ static gboolean drawCallback (GstElement *gl_sink, GstGLContext *context, GstSam
 static gboolean
 ensure_gst_glcontext()
 {
+  g_autoptr(GMutexLocker) locker = g_mutex_locker_new (&scene_info.draw_mutex);
+
+  if (GST_GL_IS_CONTEXT(scene_info.gst_gl_context))
+    return TRUE;
+
   scene_info.gst_gl_display = GST_GL_DISPLAY (gst_gl_display_x11_new_with_display (scene_info.display));
   GstGLPlatform gst_gl_platform = GST_GL_PLATFORM_GLX;
   GstGLAPI gst_gl_API = GST_GL_API_OPENGL;
@@ -388,8 +457,7 @@ handle_sync_message (GstBus * bus, GstMessage * message, gpointer userData)
 }
 
 static void
-activate (GtkApplication *app,
-          gpointer        user_data)
+activate ()
 {
   GtkWidget *window;
   GtkWidget *gl_area;
@@ -399,7 +467,7 @@ activate (GtkApplication *app,
   GstCaps *caps;
   GstBus *bus;
 
-  window = gtk_application_window_new (app);
+  window = gtk_window_new (GTK_WINDOW_TOPLEVEL);
   gtk_window_set_title (GTK_WINDOW (window), "Window");
   gtk_window_set_default_size (GTK_WINDOW (window), 800, 600);
 
@@ -412,7 +480,10 @@ activate (GtkApplication *app,
 
   gtk_widget_show_all (window);
 
-  scene_info.video_frame = NULL;
+  g_mutex_init (&scene_info.draw_mutex);
+  scene_info.current_buffer = NULL;
+  scene_info.pending_buffer = NULL;
+
   /* create elements */
   pipeline = gst_pipeline_new ("pipeline");
   videosrc = gst_element_factory_make ("videotestsrc", "videotestsrc");
@@ -453,18 +524,14 @@ int
 main (int    argc,
       char **argv)
 {
-  GtkApplication *app;
-  int status;
-
   XInitThreads();
   gtk_init (&argc, &argv);
   gst_init (&argc, &argv);
 
-  app = gtk_application_new ("org.gtk.example.glarea", G_APPLICATION_FLAGS_NONE);
-  g_signal_connect (app, "activate", G_CALLBACK (activate), NULL);
-  status = g_application_run (G_APPLICATION (app), argc, argv);
-  g_object_unref (app);
+  activate();
+  gtk_main ();
+  gst_deinit ();
 
-  return status;
+  return 0;
 }
 
