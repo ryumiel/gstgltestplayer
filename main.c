@@ -87,6 +87,8 @@ static struct {
   gchar *uri;
 
   GMutex draw_mutex;
+  GCond draw_condition;
+
   TextureBuffer* current_buffer;
   TextureBuffer* pending_buffer;
 
@@ -338,6 +340,7 @@ render (GtkGLArea *area, GdkGLContext *context)
       scene_info.current_buffer = scene_info.pending_buffer;
       scene_info.pending_buffer = NULL;
     }
+    g_cond_signal(&scene_info.draw_condition);
   }
 
   if (prev_buffer)
@@ -388,15 +391,12 @@ static gboolean drawCallback (GstElement *gl_sink, GstGLContext *context, GstSam
   GstVideoInfo video_info;
 
   g_autoptr(GMutexLocker) locker = g_mutex_locker_new (&scene_info.draw_mutex);
+  while (scene_info.pending_buffer)
     {
-      if (scene_info.pending_buffer)
-        {
-        gst_gl_window_send_message_async(scene_info.pending_buffer->gst_window,
-                                         (GstGLWindowCB)unmap_texture_buffer_callback,
-                                         scene_info.pending_buffer,
-                                         (GDestroyNotify)free_texture_buffer_callback);
-        }
+      g_print("wait for swap_buffer\n");
+      g_cond_wait(&scene_info.draw_condition, &scene_info.draw_mutex);
     }
+
   scene_info.pending_buffer = g_malloc0 (sizeof (TextureBuffer));
   TextureBuffer *buffer = scene_info.pending_buffer;
   buffer->gst_window = gst_gl_context_get_window(context);
@@ -511,6 +511,7 @@ activate ()
 
   gtk_widget_show_all (window);
 
+  g_cond_init (&scene_info.draw_condition);
   g_mutex_init (&scene_info.draw_mutex);
   scene_info.current_buffer = NULL;
   scene_info.pending_buffer = NULL;
@@ -522,8 +523,6 @@ activate ()
   glimagesink = gst_element_factory_make ("glimagesink", NULL);
 
   caps = gst_caps_new_simple("video/x-raw",
-                             "width", G_TYPE_INT, 640,
-                             "height", G_TYPE_INT, 480,
                              "framerate", GST_TYPE_FRACTION, 25, 1,
                              "format", G_TYPE_STRING, "RGBA",
                              NULL) ;
