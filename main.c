@@ -84,6 +84,8 @@ typedef struct {
 } TextureBuffer;
 
 static struct {
+  gchar *uri;
+
   GMutex draw_mutex;
   TextureBuffer* current_buffer;
   TextureBuffer* pending_buffer;
@@ -371,6 +373,7 @@ render (GtkGLArea *area, GdkGLContext *context)
   GLCOMMAND(glBindBuffer (GL_ELEMENT_ARRAY_BUFFER, 0));
   GLCOMMAND(glUseProgram (0));
 
+  glFinish();
   // we completed our drawing; the draw commands will be
   // flushed at the end of the signal emission chain, and
   // the buffers will be drawn on the window
@@ -384,19 +387,21 @@ static gboolean drawCallback (GstElement *gl_sink, GstGLContext *context, GstSam
   GstCaps *caps = gst_sample_get_caps (sample);
   GstVideoInfo video_info;
 
-  gst_video_info_from_caps (&video_info, caps);
-
-  if (scene_info.pending_buffer) {
-    gst_gl_window_send_message_async(scene_info.pending_buffer->gst_window,
-                                     (GstGLWindowCB)unmap_texture_buffer_callback,
-                                     scene_info.pending_buffer,
-                                     (GDestroyNotify)free_texture_buffer_callback);
-  }
-
+  g_autoptr(GMutexLocker) locker = g_mutex_locker_new (&scene_info.draw_mutex);
+    {
+      if (scene_info.pending_buffer)
+        {
+        gst_gl_window_send_message_async(scene_info.pending_buffer->gst_window,
+                                         (GstGLWindowCB)unmap_texture_buffer_callback,
+                                         scene_info.pending_buffer,
+                                         (GDestroyNotify)free_texture_buffer_callback);
+        }
+    }
   scene_info.pending_buffer = g_malloc0 (sizeof (TextureBuffer));
   TextureBuffer *buffer = scene_info.pending_buffer;
   buffer->gst_window = gst_gl_context_get_window(context);
 
+  gst_video_info_from_caps (&video_info, caps);
   if (!gst_video_frame_map (&buffer->video_frame, &video_info, buf, (GstMapFlags) (GST_MAP_READ | GST_MAP_GL))) {
     g_warning ("Failed to map the video buffer");
     return TRUE;
@@ -456,13 +461,39 @@ handle_sync_message (GstBus * bus, GstMessage * message, gpointer userData)
   return GST_BUS_DROP;
 }
 
+static void cb_new_pad (GstElement* decodebin, GstPad* pad, GstElement* glimagesink)
+{
+    GstPad* glimagesink_pad = gst_element_get_static_pad (glimagesink, "sink");
+
+    //only link once
+    if (GST_PAD_IS_LINKED (glimagesink_pad))
+    {
+        gst_object_unref (glimagesink_pad);
+        return;
+    }
+
+    GstCaps* caps = gst_pad_get_current_caps (pad);
+    GstStructure* str = gst_caps_get_structure (caps, 0);
+    if (!g_strrstr (gst_structure_get_name (str), "video"))
+    {
+        gst_caps_unref (caps);
+        gst_object_unref (glimagesink_pad);
+        return;
+    }
+    gst_caps_unref (caps);
+
+    GstPadLinkReturn ret = gst_pad_link (pad, glimagesink_pad);
+    if (ret != GST_PAD_LINK_OK)
+        g_warning ("Failed to link with decodebin!\n");
+}
+
 static void
 activate ()
 {
   GtkWidget *window;
   GtkWidget *gl_area;
   GtkWidget *button_box;
-  GstElement *pipeline, *videosrc, *glimagesink;
+  GstElement *pipeline, *videosrc, *decodebin, *glimagesink;
   GstStateChangeReturn ret;
   GstCaps *caps;
   GstBus *bus;
@@ -486,8 +517,9 @@ activate ()
 
   /* create elements */
   pipeline = gst_pipeline_new ("pipeline");
-  videosrc = gst_element_factory_make ("videotestsrc", "videotestsrc");
-  glimagesink = gst_element_factory_make ("glimagesink", "glimagesink");
+  videosrc = gst_element_factory_make ("filesrc", "filesrc");
+  decodebin = gst_element_factory_make ("decodebin", "decodebin");
+  glimagesink = gst_element_factory_make ("glimagesink", NULL);
 
   caps = gst_caps_new_simple("video/x-raw",
                              "width", G_TYPE_INT, 640,
@@ -496,17 +528,19 @@ activate ()
                              "format", G_TYPE_STRING, "RGBA",
                              NULL) ;
 
+  g_object_set(G_OBJECT(videosrc), "num-buffers", 800, NULL);
+  g_object_set(G_OBJECT(videosrc), "location", scene_info.uri, NULL);
   g_signal_connect_swapped(G_OBJECT(glimagesink), "client-draw", G_CALLBACK (drawCallback), NULL);
 
-  gst_bin_add_many (GST_BIN (pipeline), videosrc, glimagesink, NULL);
+  gst_bin_add_many (GST_BIN (pipeline), videosrc, decodebin, glimagesink, NULL);
 
-  gboolean link_ok = gst_element_link_filtered(videosrc, glimagesink, caps) ;
-  gst_caps_unref(caps) ;
-  if(!link_ok)
-  {
-      g_warning("Failed to link videosrc to glimagesink!\n") ;
+  if (!gst_element_link (videosrc, decodebin))
+    {
+      g_print ("Failed to link videosrc to decodebin.\n");
       return;
-  }
+    }
+
+  g_signal_connect (decodebin, "pad-added", G_CALLBACK(cb_new_pad), glimagesink);
 
   bus = gst_pipeline_get_bus (GST_PIPELINE (pipeline));
   gst_bus_set_sync_handler(bus, (GstBusSyncHandler) (handle_sync_message), NULL, NULL);
@@ -528,9 +562,18 @@ main (int    argc,
   gtk_init (&argc, &argv);
   gst_init (&argc, &argv);
 
+  if (argc < 2) {
+    g_print ("Usage: gstglview <uri-to-play>\n");
+    return 1;
+  }
+
+  scene_info.uri = g_strdup (argv[1]);
+
   activate();
   gtk_main ();
   gst_deinit ();
+
+  g_free (scene_info.uri);
 
   return 0;
 }
