@@ -93,6 +93,9 @@ static struct {
   TextureBuffer* current_buffer;
   TextureBuffer* pending_buffer;
 
+  GAsyncQueue *queue_input_buf;
+  GAsyncQueue *queue_output_buf;
+
   GLXContext gl_context;
   Display *display;
   GstGLContext *gst_gl_context;
@@ -338,21 +341,37 @@ free_texture_buffer_callback(TextureBuffer* buffer)
 static gboolean
 render (GtkGLArea *area, GdkGLContext *context)
 {
-  TextureBuffer *prev_buffer = NULL;
-  {
-    g_autoptr(GMutexLocker) locker = g_mutex_locker_new (&scene_info.draw_mutex);
-    if (!scene_info.pending_buffer && !scene_info.current_buffer)
-      return TRUE;
+  GstBuffer *inbuf = g_async_queue_try_pop (scene_info.queue_input_buf);
 
-    if (scene_info.pending_buffer) {
-      prev_buffer = scene_info.current_buffer;
-      scene_info.current_buffer = scene_info.pending_buffer;
-      scene_info.pending_buffer = NULL;
-    }
+  GstVideoMeta *v_meta;
+  GstVideoInfo info;
+  GstVideoFrame frame;
+  guint tex_id;
+
+  if (!inbuf)
+    return FALSE;
+
+  v_meta = gst_buffer_get_video_meta (inbuf);
+  if (!v_meta) {
+    g_warning ("Required Meta was not found on buffers");
+    return FALSE;
   }
 
-  if (prev_buffer)
-    gst_gl_window_send_message_async(prev_buffer->gst_window, (GstGLWindowCB)unmap_texture_buffer_callback, prev_buffer, (GDestroyNotify)free_texture_buffer_callback);
+  gst_video_info_set_format (&info, v_meta->format, v_meta->width,
+      v_meta->height);
+
+  if (!gst_video_frame_map (&frame, &info, inbuf, GST_MAP_READ | GST_MAP_GL)) {
+    g_warning ("Failed to map video frame");
+    return FALSE;
+  }
+
+  if (!gst_is_gl_memory (frame.map[0].memory)) {
+    g_warning ("Input buffer does not have GLMemory");
+    gst_video_frame_unmap (&frame);
+    return FALSE;
+  }
+
+  tex_id = *(guint *) frame.data[0];
 
   // inside this function it's safe to use GL; the given
   // #GdkGLContext has been made current to the drawable
@@ -373,7 +392,7 @@ render (GtkGLArea *area, GdkGLContext *context)
   GLCOMMAND(glBindBuffer (GL_ELEMENT_ARRAY_BUFFER, scene_info.indice_buffer));
 
   GLCOMMAND(glActiveTexture(GL_TEXTURE0));
-  GLCOMMAND(glBindTexture(GL_TEXTURE_2D, scene_info.current_buffer->texture));
+  GLCOMMAND(glBindTexture(GL_TEXTURE_2D, tex_id));
   GLCOMMAND(glUniform1i (scene_info.texture_attrib, 0));
 
   /* draw the three vertices as a triangle */
@@ -387,6 +406,9 @@ render (GtkGLArea *area, GdkGLContext *context)
   // we completed our drawing; the draw commands will be
   // flushed at the end of the signal emission chain, and
   // the buffers will be drawn on the window
+
+  gst_video_frame_unmap (&frame);
+  g_async_queue_push (scene_info.queue_output_buf, inbuf);
   return TRUE;
 }
 
@@ -468,6 +490,32 @@ handle_sync_message (GstBus * bus, GstMessage * message, gpointer userData)
   return GST_BUS_DROP;
 }
 
+/* fakesink handoff callback */
+static void
+on_gst_buffer (GstElement * fakesink, GstBuffer * buf, GstPad * pad,
+    gpointer data)
+{
+  GAsyncQueue *queue_input_buf = NULL;
+  GAsyncQueue *queue_output_buf = NULL;
+
+  gst_buffer_ref (buf);
+  queue_input_buf =
+      (GAsyncQueue *) g_object_get_data (G_OBJECT (fakesink),
+      "queue_input_buf");
+  g_async_queue_push (queue_input_buf, buf);
+  if (g_async_queue_length (queue_input_buf) > 3)
+    gtk_gl_area_queue_render (GTK_GL_AREA (scene_info.gl_area));
+
+  /* pop then unref buffer we have finished to use in sdl */
+  queue_output_buf =
+      (GAsyncQueue *) g_object_get_data (G_OBJECT (fakesink),
+      "queue_output_buf");
+  if (g_async_queue_length (queue_output_buf) > 3) {
+    GstBuffer *buf_old = (GstBuffer *) g_async_queue_pop (queue_output_buf);
+    gst_buffer_unref (buf_old);
+  }
+}
+
 static void cb_new_pad (GstElement* decodebin, GstPad* pad, GstElement* glimagesink)
 {
     GstPad* glimagesink_pad = gst_element_get_static_pad (glimagesink, "sink");
@@ -500,7 +548,7 @@ activate ()
   GtkWidget *window;
   GtkWidget *gl_area;
   GtkWidget *button_box;
-  GstElement *videosrc, *decodebin, *glimagesink;
+  GstElement *videosrc, *decodebin, *glimagesink, *fakesink;
   GstStateChangeReturn ret;
   GstCaps *caps;
   GstBus *bus;
@@ -523,23 +571,30 @@ activate ()
   scene_info.sample = NULL;
   scene_info.current_buffer = NULL;
   scene_info.pending_buffer = NULL;
+  scene_info.queue_input_buf = g_async_queue_new ();
+  scene_info.queue_output_buf = g_async_queue_new ();
 
   /* create elements */
   scene_info.pipeline = gst_pipeline_new ("pipeline");
   videosrc = gst_element_factory_make ("filesrc", "filesrc");
   decodebin = gst_element_factory_make ("decodebin", "decodebin");
-  glimagesink = gst_element_factory_make ("glimagesink", NULL);
+  glimagesink = gst_element_factory_make ("glupload", NULL);
+  fakesink = gst_element_factory_make ("fakesink", NULL);
 
   caps = gst_caps_new_simple("video/x-raw",
                              "framerate", GST_TYPE_FRACTION, 25, 1,
-                             "format", G_TYPE_STRING, "RGBA",
+                             "format", G_TYPE_STRING, "ANY",
                              NULL) ;
 
   g_object_set(G_OBJECT(videosrc), "num-buffers", 800, NULL);
   g_object_set(G_OBJECT(videosrc), "location", scene_info.uri, NULL);
-  g_signal_connect_swapped(G_OBJECT(glimagesink), "client-draw", G_CALLBACK (drawCallback), NULL);
+  g_object_set(G_OBJECT(fakesink), "signal-handoffs", TRUE, NULL);
+  g_signal_connect (fakesink, "handoff", G_CALLBACK (on_gst_buffer), NULL);
 
-  gst_bin_add_many (GST_BIN (scene_info.pipeline), videosrc, decodebin, glimagesink, NULL);
+  g_object_set_data (G_OBJECT (fakesink), "queue_input_buf", scene_info.queue_input_buf);
+  g_object_set_data (G_OBJECT (fakesink), "queue_output_buf", scene_info.queue_output_buf);
+
+  gst_bin_add_many (GST_BIN (scene_info.pipeline), videosrc, decodebin, glimagesink, fakesink, NULL);
 
   if (!gst_element_link (videosrc, decodebin))
     {
@@ -548,6 +603,12 @@ activate ()
     }
 
   g_signal_connect (decodebin, "pad-added", G_CALLBACK(cb_new_pad), glimagesink);
+
+  if (!gst_element_link (glimagesink, fakesink))
+    {
+      g_print ("Failed to link glupload to fakesink.\n");
+      return;
+    }
 
   bus = gst_pipeline_get_bus (GST_PIPELINE (scene_info.pipeline));
   gst_bus_set_sync_handler(bus, (GstBusSyncHandler) (handle_sync_message), NULL, NULL);
