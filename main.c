@@ -87,7 +87,8 @@ static struct {
   gchar *uri;
 
   GMutex draw_mutex;
-  GCond draw_condition;
+  GstSample* sample;
+  GstElement* pipeline;
 
   TextureBuffer* current_buffer;
   TextureBuffer* pending_buffer;
@@ -296,6 +297,14 @@ realize (GtkWidget *widget)
 }
 
 static void
+destroy (GtkWidget *widget)
+{
+  gst_element_set_state (GST_ELEMENT (scene_info.pipeline), GST_STATE_NULL);
+  gst_object_unref (scene_info.pipeline);
+  gtk_main_quit();
+}
+
+static void
 unrealize (GtkWidget *widget)
 {
   /* we need to ensure that the GdkGLContext is set before calling GL API */
@@ -340,7 +349,6 @@ render (GtkGLArea *area, GdkGLContext *context)
       scene_info.current_buffer = scene_info.pending_buffer;
       scene_info.pending_buffer = NULL;
     }
-    g_cond_signal(&scene_info.draw_condition);
   }
 
   if (prev_buffer)
@@ -376,7 +384,6 @@ render (GtkGLArea *area, GdkGLContext *context)
   GLCOMMAND(glBindBuffer (GL_ELEMENT_ARRAY_BUFFER, 0));
   GLCOMMAND(glUseProgram (0));
 
-  glFinish();
   // we completed our drawing; the draw commands will be
   // flushed at the end of the signal emission chain, and
   // the buffers will be drawn on the window
@@ -391,11 +398,11 @@ static gboolean drawCallback (GstElement *gl_sink, GstGLContext *context, GstSam
   GstVideoInfo video_info;
 
   g_autoptr(GMutexLocker) locker = g_mutex_locker_new (&scene_info.draw_mutex);
-  while (scene_info.pending_buffer)
-    {
-      g_print("wait for swap_buffer\n");
-      g_cond_wait(&scene_info.draw_condition, &scene_info.draw_mutex);
-    }
+
+  if (scene_info.sample)
+    gst_sample_unref (scene_info.sample);
+  scene_info.sample = sample;
+  gst_sample_ref (scene_info.sample);
 
   scene_info.pending_buffer = g_malloc0 (sizeof (TextureBuffer));
   TextureBuffer *buffer = scene_info.pending_buffer;
@@ -408,7 +415,7 @@ static gboolean drawCallback (GstElement *gl_sink, GstGLContext *context, GstSam
   }
   buffer->texture = *(guint *) buffer->video_frame.data[0];
 
-  gtk_widget_queue_draw (scene_info.gl_area);
+  gtk_gl_area_queue_render (GTK_GL_AREA (scene_info.gl_area));
   return TRUE;
 }
 
@@ -493,7 +500,7 @@ activate ()
   GtkWidget *window;
   GtkWidget *gl_area;
   GtkWidget *button_box;
-  GstElement *pipeline, *videosrc, *decodebin, *glimagesink;
+  GstElement *videosrc, *decodebin, *glimagesink;
   GstStateChangeReturn ret;
   GstCaps *caps;
   GstBus *bus;
@@ -506,18 +513,19 @@ activate ()
   g_signal_connect (gl_area, "render", G_CALLBACK (render), NULL);
   g_signal_connect (gl_area, "realize", G_CALLBACK (realize), NULL);
   g_signal_connect (gl_area, "unrealize", G_CALLBACK (unrealize), NULL);
+  gtk_gl_area_set_auto_render (GTK_GL_AREA (gl_area), FALSE);
   gtk_container_add (GTK_CONTAINER (window), gl_area);
   scene_info.gl_area = gl_area;
 
   gtk_widget_show_all (window);
 
-  g_cond_init (&scene_info.draw_condition);
   g_mutex_init (&scene_info.draw_mutex);
+  scene_info.sample = NULL;
   scene_info.current_buffer = NULL;
   scene_info.pending_buffer = NULL;
 
   /* create elements */
-  pipeline = gst_pipeline_new ("pipeline");
+  scene_info.pipeline = gst_pipeline_new ("pipeline");
   videosrc = gst_element_factory_make ("filesrc", "filesrc");
   decodebin = gst_element_factory_make ("decodebin", "decodebin");
   glimagesink = gst_element_factory_make ("glimagesink", NULL);
@@ -531,7 +539,7 @@ activate ()
   g_object_set(G_OBJECT(videosrc), "location", scene_info.uri, NULL);
   g_signal_connect_swapped(G_OBJECT(glimagesink), "client-draw", G_CALLBACK (drawCallback), NULL);
 
-  gst_bin_add_many (GST_BIN (pipeline), videosrc, decodebin, glimagesink, NULL);
+  gst_bin_add_many (GST_BIN (scene_info.pipeline), videosrc, decodebin, glimagesink, NULL);
 
   if (!gst_element_link (videosrc, decodebin))
     {
@@ -541,12 +549,12 @@ activate ()
 
   g_signal_connect (decodebin, "pad-added", G_CALLBACK(cb_new_pad), glimagesink);
 
-  bus = gst_pipeline_get_bus (GST_PIPELINE (pipeline));
+  bus = gst_pipeline_get_bus (GST_PIPELINE (scene_info.pipeline));
   gst_bus_set_sync_handler(bus, (GstBusSyncHandler) (handle_sync_message), NULL, NULL);
   gst_object_unref (bus);
 
   //start
-  ret = gst_element_set_state (pipeline, GST_STATE_PLAYING);
+  ret = gst_element_set_state (scene_info.pipeline, GST_STATE_PLAYING);
   if (ret == GST_STATE_CHANGE_FAILURE) {
     g_print ("Failed to start up pipeline!\n");
     return;
