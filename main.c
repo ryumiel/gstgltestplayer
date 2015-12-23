@@ -583,7 +583,7 @@ activate ()
 
   caps = gst_caps_new_simple("video/x-raw",
                              "framerate", GST_TYPE_FRACTION, 25, 1,
-                             "format", G_TYPE_STRING, "ANY",
+                             "format", G_TYPE_STRING, "video/x-raw(ANY)",
                              NULL) ;
 
   g_object_set(G_OBJECT(videosrc), "num-buffers", 800, NULL);
@@ -593,6 +593,8 @@ activate ()
 
   g_object_set_data (G_OBJECT (fakesink), "queue_input_buf", scene_info.queue_input_buf);
   g_object_set_data (G_OBJECT (fakesink), "queue_output_buf", scene_info.queue_output_buf);
+  g_object_set (G_OBJECT (fakesink), "silent", TRUE, NULL);
+  g_object_set (G_OBJECT (fakesink), "sync", TRUE, NULL);
 
   gst_bin_add_many (GST_BIN (scene_info.pipeline), videosrc, decodebin, glimagesink, fakesink, NULL);
 
