@@ -77,6 +77,15 @@ static GLushort const vertex_indice[] = {
  0, 1, 2, 0, 2, 3,
 };
 
+#define GST_WEBKIT_VIDEO_FORMATS "{ RGBA }" \
+
+#define GST_WEBKIT_VIDEO_CAPS \
+    "video/x-raw(" GST_CAPS_FEATURE_MEMORY_GL_MEMORY "), "              \
+    "format = (string) " GST_WEBKIT_VIDEO_FORMATS ", "                  \
+    "width = " GST_VIDEO_SIZE_RANGE ", "                                \
+    "height = " GST_VIDEO_SIZE_RANGE ", "                               \
+    "framerate = " GST_VIDEO_FPS_RANGE
+
 typedef struct {
   GstVideoFrame video_frame;
   guint texture;
@@ -446,7 +455,7 @@ ensure_gst_glcontext()
 {
   g_autoptr(GMutexLocker) locker = g_mutex_locker_new (&scene_info.draw_mutex);
 
-  if (GST_GL_IS_CONTEXT(scene_info.gst_gl_context))
+  if (GST_IS_GL_CONTEXT(scene_info.gst_gl_context))
     return TRUE;
 
   scene_info.gst_gl_display = GST_GL_DISPLAY (gst_gl_display_x11_new_with_display (scene_info.display));
@@ -542,13 +551,47 @@ static void cb_new_pad (GstElement* decodebin, GstPad* pad, GstElement* glimages
         g_warning ("Failed to link with decodebin!\n");
 }
 
+GstElement* createVideoSink()
+{
+  GstElement *videosink, *upload, *colorconvert, *fakesink;
+  GstCaps *caps;
+  GstPad *pad;
+
+  videosink = gst_bin_new("gstglsinkbin");
+  upload = gst_element_factory_make("glupload", NULL);
+  colorconvert = gst_element_factory_make("glcolorconvert", NULL);
+  fakesink = gst_element_factory_make("fakesink", NULL);
+
+  gst_bin_add_many(GST_BIN(videosink), upload, colorconvert, fakesink, NULL);
+
+  caps = gst_caps_from_string(GST_WEBKIT_VIDEO_CAPS);
+
+  gst_element_link_pads(upload, "src", colorconvert, "sink");
+  gst_element_link_pads_filtered(colorconvert, "src", fakesink, "sink", caps);
+  gst_caps_unref(caps);
+
+  pad = gst_element_get_static_pad(upload, "sink");
+  gst_element_add_pad(videosink, gst_ghost_pad_new("sink", pad));
+  g_object_unref(pad);
+
+  pad = gst_element_get_static_pad(fakesink, "sink");
+  g_object_set(fakesink, "enable-last-sample", FALSE, "signal-handoffs", TRUE, "silent", TRUE, "sync", TRUE, NULL);
+  g_object_unref(pad);
+
+  g_signal_connect (fakesink, "handoff", G_CALLBACK (on_gst_buffer), NULL);
+  g_object_set_data (G_OBJECT (fakesink), "queue_input_buf", scene_info.queue_input_buf);
+  g_object_set_data (G_OBJECT (fakesink), "queue_output_buf", scene_info.queue_output_buf);
+
+  return videosink;
+}
+
 static void
 activate ()
 {
   GtkWidget *window;
   GtkWidget *gl_area;
   GtkWidget *button_box;
-  GstElement *videosrc, *decodebin, *glimagesink, *fakesink;
+  GstElement *playbin, *videosink;
   GstStateChangeReturn ret;
   GstCaps *caps;
   GstBus *bus;
@@ -576,41 +619,12 @@ activate ()
 
   /* create elements */
   scene_info.pipeline = gst_pipeline_new ("pipeline");
-  videosrc = gst_element_factory_make ("filesrc", "filesrc");
-  decodebin = gst_element_factory_make ("decodebin", "decodebin");
-  glimagesink = gst_element_factory_make ("glupload", NULL);
-  fakesink = gst_element_factory_make ("fakesink", NULL);
+  playbin = gst_element_factory_make ("playbin", "playbin");
+  videosink = createVideoSink();
+  g_object_set(playbin, "video-sink", createVideoSink(), NULL);
 
-  caps = gst_caps_new_simple("video/x-raw",
-                             "framerate", GST_TYPE_FRACTION, 25, 1,
-                             "format", G_TYPE_STRING, "video/x-raw(ANY)",
-                             NULL) ;
-
-  g_object_set(G_OBJECT(videosrc), "num-buffers", 800, NULL);
-  g_object_set(G_OBJECT(videosrc), "location", scene_info.uri, NULL);
-  g_object_set(G_OBJECT(fakesink), "signal-handoffs", TRUE, NULL);
-  g_signal_connect (fakesink, "handoff", G_CALLBACK (on_gst_buffer), NULL);
-
-  g_object_set_data (G_OBJECT (fakesink), "queue_input_buf", scene_info.queue_input_buf);
-  g_object_set_data (G_OBJECT (fakesink), "queue_output_buf", scene_info.queue_output_buf);
-  g_object_set (G_OBJECT (fakesink), "silent", TRUE, NULL);
-  g_object_set (G_OBJECT (fakesink), "sync", TRUE, NULL);
-
-  gst_bin_add_many (GST_BIN (scene_info.pipeline), videosrc, decodebin, glimagesink, fakesink, NULL);
-
-  if (!gst_element_link (videosrc, decodebin))
-    {
-      g_print ("Failed to link videosrc to decodebin.\n");
-      return;
-    }
-
-  g_signal_connect (decodebin, "pad-added", G_CALLBACK(cb_new_pad), glimagesink);
-
-  if (!gst_element_link (glimagesink, fakesink))
-    {
-      g_print ("Failed to link glupload to fakesink.\n");
-      return;
-    }
+  fprintf(stderr, "%s\n", scene_info.uri);
+  g_object_set (G_OBJECT (playbin), "uri", scene_info.uri, NULL);
 
   bus = gst_pipeline_get_bus (GST_PIPELINE (scene_info.pipeline));
   gst_bus_set_sync_handler(bus, (GstBusSyncHandler) (handle_sync_message), NULL, NULL);
@@ -628,6 +642,7 @@ int
 main (int    argc,
       char **argv)
 {
+  GError* error;
   XInitThreads();
   gtk_init (&argc, &argv);
   gst_init (&argc, &argv);
@@ -637,7 +652,7 @@ main (int    argc,
     return 1;
   }
 
-  scene_info.uri = g_strdup (argv[1]);
+  scene_info.uri = gst_filename_to_uri (argv[1], &error);
 
   activate();
   gtk_main ();
