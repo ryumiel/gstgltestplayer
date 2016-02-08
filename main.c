@@ -585,13 +585,28 @@ GstElement* createVideoSink()
   return videosink;
 }
 
+unsigned getGstPlayFlag(const char* nick)
+{
+  static GFlagsClass* flagsClass = NULL;
+  GFlagsValue* flag = NULL;
+
+  if (!flagsClass)
+    flagsClass = (GFlagsClass*)(g_type_class_ref(g_type_from_name("GstPlayFlags")));
+
+  flag = g_flags_get_value_by_nick(flagsClass, nick);
+  if (!flag)
+      return 0;
+
+  return flag->value;
+}
+
 static void
 activate ()
 {
   GtkWidget *window;
   GtkWidget *gl_area;
   GtkWidget *button_box;
-  GstElement *playbin, *videosink;
+  GstElement *playbin;
   GstStateChangeReturn ret;
   GstCaps *caps;
   GstBus *bus;
@@ -620,8 +635,14 @@ activate ()
   /* create elements */
   scene_info.pipeline = gst_pipeline_new ("pipeline");
   playbin = gst_element_factory_make ("playbin", "playbin");
-  videosink = createVideoSink();
   g_object_set(playbin, "video-sink", createVideoSink(), NULL);
+  g_object_set(playbin, "audio-sink", gst_element_factory_make("autoaudiosink", 0), NULL);
+
+  unsigned flagText = getGstPlayFlag("text");
+  unsigned flagAudio = getGstPlayFlag("audio");
+  unsigned flagVideo = getGstPlayFlag("video");
+  unsigned flagNativeVideo = getGstPlayFlag("native-video");
+  g_object_set(scene_info.pipeline, "flags", flagText | flagAudio | flagVideo | flagNativeVideo, NULL);
 
   fprintf(stderr, "%s\n", scene_info.uri);
   g_object_set (G_OBJECT (playbin), "uri", scene_info.uri, NULL);
