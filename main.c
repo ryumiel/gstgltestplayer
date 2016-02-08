@@ -585,7 +585,7 @@ GstElement* createVideoSink()
   return videosink;
 }
 
-unsigned getGstPlayFlag(const char* nick)
+static unsigned getGstPlayFlag(const char* nick)
 {
   static GFlagsClass* flagsClass = NULL;
   GFlagsValue* flag = NULL;
@@ -642,8 +642,9 @@ activate ()
   unsigned flagAudio = getGstPlayFlag("audio");
   unsigned flagVideo = getGstPlayFlag("video");
   unsigned flagNativeVideo = getGstPlayFlag("native-video");
-  g_object_set(scene_info.pipeline, "flags", flagText | flagAudio | flagVideo | flagNativeVideo, NULL);
+  g_object_set(playbin, "flags", flagText | flagAudio | flagVideo | flagNativeVideo, NULL);
 
+  gst_bin_add_many(GST_BIN(scene_info.pipeline), playbin, NULL);
   fprintf(stderr, "%s\n", scene_info.uri);
   g_object_set (G_OBJECT (playbin), "uri", scene_info.uri, NULL);
 
