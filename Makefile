@@ -20,7 +20,7 @@ GLIB_COMPILE_SCHEMAS = $(shell $(PKGCONFIG) --variable=glib_compile_schemas gio-
 
 SRC = main.c
 GEN =
-BIN = glarea
+BIN = gstgltestplayer
 
 ALL = $(GEN) $(SRC)
 OBJS = $(ALL:.c=.o)
