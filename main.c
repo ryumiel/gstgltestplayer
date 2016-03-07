@@ -421,35 +421,6 @@ render (GtkGLArea *area, GdkGLContext *context)
   return TRUE;
 }
 
-//client draw callback
-static gboolean drawCallback (GstElement *gl_sink, GstGLContext *context, GstSample *sample, gpointer data)
-{
-  GstBuffer *buf = gst_sample_get_buffer (sample);
-  GstCaps *caps = gst_sample_get_caps (sample);
-  GstVideoInfo video_info;
-
-  g_autoptr(GMutexLocker) locker = g_mutex_locker_new (&scene_info.draw_mutex);
-
-  if (scene_info.sample)
-    gst_sample_unref (scene_info.sample);
-  scene_info.sample = sample;
-  gst_sample_ref (scene_info.sample);
-
-  scene_info.pending_buffer = g_malloc0 (sizeof (TextureBuffer));
-  TextureBuffer *buffer = scene_info.pending_buffer;
-  buffer->gst_window = gst_gl_context_get_window(context);
-
-  gst_video_info_from_caps (&video_info, caps);
-  if (!gst_video_frame_map (&buffer->video_frame, &video_info, buf, (GstMapFlags) (GST_MAP_READ | GST_MAP_GL))) {
-    g_warning ("Failed to map the video buffer");
-    return TRUE;
-  }
-  buffer->texture = *(guint *) buffer->video_frame.data[0];
-
-  gtk_gl_area_queue_render (GTK_GL_AREA (scene_info.gl_area));
-  return TRUE;
-}
-
 static gboolean
 ensure_gst_glcontext()
 {
@@ -523,32 +494,6 @@ on_gst_buffer (GstElement * fakesink, GstBuffer * buf, GstPad * pad,
     GstBuffer *buf_old = (GstBuffer *) g_async_queue_pop (queue_output_buf);
     gst_buffer_unref (buf_old);
   }
-}
-
-static void cb_new_pad (GstElement* decodebin, GstPad* pad, GstElement* glimagesink)
-{
-    GstPad* glimagesink_pad = gst_element_get_static_pad (glimagesink, "sink");
-
-    //only link once
-    if (GST_PAD_IS_LINKED (glimagesink_pad))
-    {
-        gst_object_unref (glimagesink_pad);
-        return;
-    }
-
-    GstCaps* caps = gst_pad_get_current_caps (pad);
-    GstStructure* str = gst_caps_get_structure (caps, 0);
-    if (!g_strrstr (gst_structure_get_name (str), "video"))
-    {
-        gst_caps_unref (caps);
-        gst_object_unref (glimagesink_pad);
-        return;
-    }
-    gst_caps_unref (caps);
-
-    GstPadLinkReturn ret = gst_pad_link (pad, glimagesink_pad);
-    if (ret != GST_PAD_LINK_OK)
-        g_warning ("Failed to link with decodebin!\n");
 }
 
 GstElement* createVideoSink()
