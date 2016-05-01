@@ -111,7 +111,7 @@ static struct {
   GstGLDisplay *gst_gl_display;
 
   GtkWidget *gl_area;
-  guint vao;
+  guint vertex_buffer;
   guint indice_buffer;
   guint program;
   guint vertex_pos_attrib;
@@ -123,12 +123,9 @@ static void
 init_buffers (guint  vertex_pos_attrib,
               guint  texture_coord_attrib,
               guint *indice_buffer_out,
-              guint *vao_out)
+              guint *vertex_buffer_out)
 {
-  guint vao, vertex_buffer, indice_buffer;
-
-  GLCOMMAND(glGenVertexArrays (1, &vao));
-  GLCOMMAND(glBindVertexArray (vao));
+  guint vertex_buffer, indice_buffer;
 
   GLCOMMAND(glGenBuffers (1, &vertex_buffer));
   GLCOMMAND(glBindBuffer (GL_ARRAY_BUFFER, vertex_buffer));
@@ -148,13 +145,10 @@ init_buffers (guint  vertex_pos_attrib,
 
   /* reset the state; we will re-enable buffers when needed */
   GLCOMMAND(glBindBuffer (GL_ARRAY_BUFFER, 0));
-  GLCOMMAND(glBindVertexArray (0));
-
-  GLCOMMAND(glDeleteBuffers (1, &vertex_buffer));
   GLCOMMAND(glBindBuffer (GL_ELEMENT_ARRAY_BUFFER, 0));
 
-  if (vao_out != NULL)
-    *vao_out = vao;
+  if (vertex_buffer_out != NULL)
+    *vertex_buffer_out = vertex_buffer;
   if (indice_buffer_out != NULL)
     *indice_buffer_out = indice_buffer;
 }
@@ -300,7 +294,7 @@ realize (GtkWidget *widget)
 
   /* initialize the vertex buffers */
   init_buffers (scene_info.vertex_pos_attrib, scene_info.texture_coord_attrib,
-                &scene_info.indice_buffer, &scene_info.vao);
+                &scene_info.indice_buffer, &scene_info.vertex_buffer);
 
   g_autoptr(GMutexLocker) locker = g_mutex_locker_new (&scene_info.draw_mutex);
 
@@ -327,8 +321,8 @@ unrealize (GtkWidget *widget)
     return;
 
   /* destroy all the resources we created */
-  if (scene_info.vao != 0)
-    glDeleteBuffers (1, &scene_info.vao);
+  if (scene_info.vertex_buffer != 0)
+    glDeleteBuffers (1, &scene_info.vertex_buffer);
   if (scene_info.indice_buffer != 0)
     glDeleteBuffers (1, &scene_info.indice_buffer);
   if (scene_info.program != 0)
@@ -391,13 +385,13 @@ render (GtkGLArea *area, GdkGLContext *context)
   GLCOMMAND(glClearColor (0, 0, 0, 0));
   GLCOMMAND(glClear (GL_COLOR_BUFFER_BIT));
 
-  if (scene_info.program == 0 || scene_info.vao == 0)
+  if (scene_info.program == 0 || scene_info.vertex_buffer == 0)
     return TRUE;
 
   /* load our program */
   GLCOMMAND(glUseProgram (scene_info.program));
 
-  GLCOMMAND(glBindVertexArray (scene_info.vao));
+  GLCOMMAND(glBindBuffer (GL_ARRAY_BUFFER, scene_info.vertex_buffer));
   GLCOMMAND(glBindBuffer (GL_ELEMENT_ARRAY_BUFFER, scene_info.indice_buffer));
 
   GLCOMMAND(glActiveTexture(GL_TEXTURE0));
